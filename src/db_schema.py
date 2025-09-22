@@ -16,7 +16,7 @@ def create_tables():
     """ Create tables in the PostgreSQL database """
     commands = (
         """
-        CREATE TABLE candidates (
+        CREATE TABLE IF NOT EXISTS candidates (
             candidate_id VARCHAR(255) PRIMARY KEY,
             name VARCHAR(255) NOT NULL,
             party VARCHAR(255),
@@ -26,7 +26,7 @@ def create_tables():
         )
         """,
         """
-        CREATE TABLE committees (
+        CREATE TABLE IF NOT EXISTS committees (
             committee_id VARCHAR(255) PRIMARY KEY,
             name VARCHAR(255) NOT NULL,
             city VARCHAR(255),
@@ -36,17 +36,31 @@ def create_tables():
         )
         """,
         """
-        CREATE TABLE contributions (
+        CREATE TABLE IF NOT EXISTS contributors (
+            contributor_id SERIAL PRIMARY KEY,
+            name VARCHAR(255) NOT NULL,
+            city VARCHAR(255),
+            state VARCHAR(2),
+            zip_code VARCHAR(255),
+            occupation VARCHAR(255),
+            employer VARCHAR(255),
+            UNIQUE(name, city, state, zip_code, occupation, employer)
+        )
+        """,
+        """
+        CREATE TABLE IF NOT EXISTS contributions (
             contribution_id SERIAL PRIMARY KEY,
             committee_id VARCHAR(255) REFERENCES committees(committee_id),
-            contributor_name VARCHAR(255),
-            contributor_city VARCHAR(255),
-            contributor_state VARCHAR(2),
-            contributor_zip_code VARCHAR(255),
+            contributor_id INTEGER REFERENCES contributors(contributor_id),
             contribution_date DATE,
-            contribution_amount NUMERIC(12, 2),
-            contributor_occupation VARCHAR(255),
-            contributor_employer VARCHAR(255)
+            contribution_amount NUMERIC(12, 2)
+        )
+        """,
+        """
+        CREATE TABLE IF NOT EXISTS candidate_committees (
+            candidate_id VARCHAR(255) REFERENCES candidates(candidate_id),
+            committee_id VARCHAR(255) REFERENCES committees(committee_id),
+            PRIMARY KEY (candidate_id, committee_id)
         )
         """
     )
@@ -56,19 +70,14 @@ def create_tables():
         conn = psycopg2.connect(
             dbname=DB_NAME, user=DB_USER, password=DB_PASSWORD, host=DB_HOST, port=DB_PORT
         )
-        cur = conn.cursor()
-        # create table one by one
-        for command in commands:
-            cur.execute(command)
-        # close communication with the PostgreSQL database server
-        cur.close()
-        # commit the changes
-        conn.commit()
+        with conn:
+            with conn.cursor() as cur:
+                # create table one by one
+                for command in commands:
+                    cur.execute(command)
+        print("Tables created successfully (if they did not exist).")
     except (Exception, psycopg2.DatabaseError) as error:
         print(error)
-    finally:
-        if conn is not None:
-            conn.close()
 
 if __name__ == '__main__':
     create_tables()
