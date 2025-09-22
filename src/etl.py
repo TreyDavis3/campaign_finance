@@ -1,6 +1,6 @@
-
 import pandas as pd
 import psycopg2
+from psycopg2 import sql
 from fec_api import get_candidates, get_committees, get_contributions
 from dotenv import load_dotenv
 import os
@@ -61,25 +61,41 @@ def transform_contributions_to_df(contributions_data):
     return pd.DataFrame(transformed_data)
 
 def load_df_to_db(df, table_name, primary_key):
-    """Loads a pandas DataFrame into a PostgreSQL table."""
+    """Loads a pandas DataFrame into a PostgreSQL table using psycopg2.sql for security."""
     conn = None
     try:
         conn = psycopg2.connect(
             dbname=DB_NAME, user=DB_USER, password=DB_PASSWORD, host=DB_HOST, port=DB_PORT
         )
         cur = conn.cursor()
-        for index, row in df.iterrows():
-            columns = ', '.join(row.index)
-            placeholders = ', '.join(['%s'] * len(row))
-            update_clause = ', '.join([f"{col} = EXCLUDED.{col}" for col in row.index if col != primary_key])
-            # Skip update for contributions table as it has a serial primary key
-            if table_name == 'contributions':
-                update_clause = ''
-            else:
-                update_clause = f"ON CONFLICT ({primary_key}) DO UPDATE SET {update_clause}"
 
-            query = f"INSERT INTO {table_name} ({columns}) VALUES ({placeholders}) {update_clause}"
+        table = sql.Identifier(table_name)
+        columns = [sql.Identifier(col) for col in df.columns]
+        placeholders = sql.SQL(', ').join(sql.Placeholder() * len(df.columns))
+
+        if table_name == 'contributions':
+            query = sql.SQL("INSERT INTO {} ({}) VALUES ({})").format(
+                table,
+                sql.SQL(', ').join(columns),
+                placeholders
+            )
+        else:
+            primary_key_identifier = sql.Identifier(primary_key)
+            update_columns = [col for col in df.columns if col != primary_key]
+            update_clause = sql.SQL(', ').join(
+                [sql.SQL("{} = EXCLUDED.{}").format(sql.Identifier(col), sql.Identifier(col)) for col in update_columns]
+            )
+            query = sql.SQL("INSERT INTO {} ({}) VALUES ({}) ON CONFLICT ({}) DO UPDATE SET {}").format(
+                table,
+                sql.SQL(', ').join(columns),
+                placeholders,
+                primary_key_identifier,
+                update_clause
+            )
+
+        for index, row in df.iterrows():
             cur.execute(query, tuple(row.where(pd.notnull(row), None)))
+            
         conn.commit()
         cur.close()
     except (Exception, psycopg2.DatabaseError) as error:
