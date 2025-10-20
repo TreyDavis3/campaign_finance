@@ -138,16 +138,16 @@ def fetch_committee_details(session, api_key, committee_id):
     committee_data = get_committees(session, api_key, committee_id=committee_id)
     return transform_committees_to_df(committee_data)
 
-if __name__ == "__main__":
+def run_etl(api_key=None, cycle=2024, office="P"):
     fec_session = create_fec_session()
     db_conn = None
     try:
         db_conn = get_db_connection()
-        API_KEY = os.getenv("FEC_API_KEY")
+        API_KEY = api_key or os.getenv("FEC_API_KEY")
 
         # 1. Fetch and load candidates
         logger.info("Fetching and loading candidates...")
-        candidates_data = get_candidates(fec_session, API_KEY, cycle=2024, office="P")
+        candidates_data = get_candidates(fec_session, API_KEY, cycle=cycle, office=office)
         candidates_df = transform_candidates_to_df(candidates_data)
         if not candidates_df.empty:
             load_df_to_db(db_conn, candidates_df, 'candidates', 'candidate_id')
@@ -156,7 +156,7 @@ if __name__ == "__main__":
         logger.info("Fetching contributions in parallel and gathering committee IDs...")
         contrib_dfs = []
         all_committee_ids = set()
-        max_workers = min(8, max(2, (len(candidates_df) // 10) or 2))
+        max_workers = min(DEFAULT_MAX_WORKERS, max(2, (len(candidates_df) // 10) or 2))
 
         with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
             future_to_candidate = {executor.submit(fetch_contributions_for_candidate, fec_session, API_KEY, name): name for name in candidates_df['name']}
@@ -164,8 +164,8 @@ if __name__ == "__main__":
                 name = future_to_candidate[future]
                 try:
                     contributions_df = future.result()
-                except Exception as e:
-                    logger.exception("Failed to fetch contributions for %s: %s", name, e)
+                except Exception:
+                    logger.exception("Failed to fetch contributions for %s", name)
                     continue
                 if not contributions_df.empty:
                     contrib_dfs.append(contributions_df)
@@ -208,7 +208,7 @@ if __name__ == "__main__":
                 values_sql = sql.SQL(', ').join(sql.Placeholder() * len(insert_cols))
                 insert_query = sql.SQL('INSERT INTO contributors ({}) VALUES ({}) ON CONFLICT (contributor_hash) DO NOTHING').format(cols_sql, values_sql)
                 tuples = [tuple(row[col] if col in row else None for col in insert_cols) for _, row in contributors_df.iterrows()]
-                chunk_size = 500
+                chunk_size = DEFAULT_CHUNK_SIZE_UPSERT
                 for i in range(0, len(tuples), chunk_size):
                     execute_values(cur, insert_query.as_string(db_conn), tuples[i:i+chunk_size], template=None, page_size=chunk_size)
                 db_conn.commit()
@@ -235,15 +235,15 @@ if __name__ == "__main__":
         all_committees_df = pd.DataFrame()
         if all_committee_ids:
             committee_dfs = []
-            max_workers = min(8, max(2, (len(all_committee_ids) // 10) or 2))
+            max_workers = min(DEFAULT_MAX_WORKERS, max(2, (len(all_committee_ids) // 10) or 2))
             with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
                 future_to_committee = {executor.submit(fetch_committee_details, fec_session, API_KEY, cid): cid for cid in all_committee_ids}
                 for future in concurrent.futures.as_completed(future_to_committee):
                     cid = future_to_committee[future]
                     try:
                         committee_df = future.result()
-                    except Exception as e:
-                        logger.exception("Failed to fetch committee %s: %s", cid, e)
+                    except Exception:
+                        logger.exception("Failed to fetch committee %s", cid)
                         continue
                     if not committee_df.empty:
                         committee_dfs.append(committee_df)
@@ -259,11 +259,17 @@ if __name__ == "__main__":
             final_contribs = all_contributions_df[['committee_id', 'contributor_id', 'contribution_date', 'contribution_amount', 'contribution_hash']].copy()
             load_df_to_db(db_conn, final_contribs, 'contributions', 'contribution_id')
 
-    except Exception as e:
-        logger.exception("An error occurred during the ETL process: %s", e)
+    except Exception:
+        logger.exception("An error occurred during the ETL process")
+        raise
     finally:
         if db_conn:
             db_conn.close()
             logger.info("Database connection closed.")
         fec_session.close()
+
+
+if __name__ == "__main__":
+    # Keep backwards compatible: run as script
+    run_etl()
 
