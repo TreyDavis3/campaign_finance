@@ -4,13 +4,26 @@ import hashlib
 import pandas as pd
 from psycopg2 import sql
 from psycopg2.extras import execute_values
-from fec_api import get_candidates, get_committees, get_contributions, create_fec_session
-from db_schema import get_db_connection  # Import the centralized connection function
+
+# Support running as a package (pytest) or as a script
+try:
+    # When running tests (import src.etl) these will resolve
+    from src.fec_api import get_candidates, get_committees, get_contributions, create_fec_session
+    from src.db_schema import get_db_connection  # Import the centralized connection function
+except Exception:
+    # Fallback for running the script directly (python src/etl.py)
+    from fec_api import get_candidates, get_committees, get_contributions, create_fec_session
+    from db_schema import get_db_connection  # Import the centralized connection function
 import concurrent.futures
 
 # Logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+
+# Configurable worker/chunk sizes (can be overridden via environment variables)
+DEFAULT_MAX_WORKERS = int(os.getenv("ETL_MAX_WORKERS", "8"))
+DEFAULT_CHUNK_SIZE_INSERT = int(os.getenv("ETL_CHUNK_SIZE_INSERT", "1000"))
+DEFAULT_CHUNK_SIZE_UPSERT = int(os.getenv("ETL_CHUNK_SIZE_UPSERT", "500"))
 
 
 def _normalize_str(s: str) -> str:
