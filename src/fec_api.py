@@ -60,11 +60,10 @@ def _fetch_all_pages(session, url, params):
 
         except requests.exceptions.RequestException as e:
             print(f"Error during API request: {e}")
-            # Decide whether to break or continue based on the error
-            break
+            raise e
         except Exception as e:
             print(f"An unexpected error occurred: {e}")
-            break
+            raise e
 
     return {"results": all_results}
 

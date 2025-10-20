@@ -1,21 +1,27 @@
+import os
+import logging
+import hashlib
 import pandas as pd
-import psycopg2
 from psycopg2 import sql
 from psycopg2.extras import execute_values
 from fec_api import get_candidates, get_committees, get_contributions, create_fec_session
-from dotenv import load_dotenv
-import os
+from db_schema import get_db_connection  # Import the centralized connection function
 import concurrent.futures
 
-load_dotenv()
+# Logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
-# Database connection parameters
-DB_NAME = os.getenv("DB_NAME")
-DB_USER = os.getenv("DB_USER")
-DB_PASSWORD = os.getenv("DB_PASSWORD")
-DB_HOST = os.getenv("DB_HOST")
-DB_PORT = os.getenv("DB_PORT")
-API_KEY = os.getenv("FEC_API_KEY")
+
+def _normalize_str(s: str) -> str:
+    if s is None:
+        return ""
+    return " ".join(str(s).lower().strip().split())
+
+
+def _sha256_hex(s: str) -> str:
+    return hashlib.sha256(s.encode("utf-8")).hexdigest()
+
 
 def transform_candidates_to_df(candidates_data):
     """Transforms the raw candidate data into a pandas DataFrame."""
@@ -62,112 +68,189 @@ def transform_contributions_to_df(contributions_data):
         })
     return pd.DataFrame(transformed_data)
 
-def load_df_to_db(df, table_name, primary_key):
-    """Loads a pandas DataFrame into a PostgreSQL table using psycopg2.extras.execute_values for speed."""
+def load_df_to_db(conn, df, table_name, primary_key):
+    """Loads a pandas DataFrame into a PostgreSQL table using a provided connection."""
     if df.empty:
-        print(f"DataFrame for table {table_name} is empty. Nothing to load.")
+        logger.info("DataFrame for table %s is empty. Nothing to load.", table_name)
+        return
         return
 
-    conn = None
-    try:
-        conn = psycopg2.connect(
-            dbname=DB_NAME, user=DB_USER, password=DB_PASSWORD, host=DB_HOST, port=DB_PORT
-        )
-        with conn.cursor() as cur:
-            table = sql.Identifier(table_name)
-            columns = [sql.Identifier(col) for col in df.columns]
-            cols_sql = sql.SQL(', ').join(columns)
-            
-            # Convert DataFrame to a list of tuples
-            tuples = [tuple(x) for x in df.to_numpy()]
+    # Insert in chunks to avoid huge payloads
+    tuples = [tuple(x) for x in df.to_numpy()]
+    chunk_size = 1000
 
-            if table_name == 'contributions':
-                query = sql.SQL("INSERT INTO {} ({}) VALUES %s").format(
-                    table,
-                    cols_sql
-                )
-                execute_values(cur, query, tuples)
-            else:
-                # For tables with a primary key, use ON CONFLICT DO UPDATE
-                primary_key_identifier = sql.Identifier(primary_key)
-                update_cols = [col for col in df.columns if col != primary_key]
-                
-                # Create the SET part of the query
-                update_clause = sql.SQL(', ').join(
-                    sql.SQL("{} = EXCLUDED.{}").format(sql.Identifier(col), sql.Identifier(col))
-                    for col in update_cols
-                )
+    with conn.cursor() as cur:
+        table = sql.Identifier(table_name)
+        columns = [sql.Identifier(col) for col in df.columns]
+        cols_sql = sql.SQL(', ').join(columns)
 
-                query = sql.SQL("INSERT INTO {} ({}) VALUES %s ON CONFLICT ({}) DO UPDATE SET {}").format(
-                    table,
-                    cols_sql,
-                    primary_key_identifier,
-                    update_clause
-                )
-                execute_values(cur, query, tuples)
+        if table_name == 'contributions':
+            query = sql.SQL("INSERT INTO {} ({}) VALUES %s ON CONFLICT (contribution_hash) DO NOTHING").format(
+                table,
+                cols_sql,
+            )
+            for i in range(0, len(tuples), chunk_size):
+                execute_values(cur, query, tuples[i:i+chunk_size])
+        else:
+            # Use primary key upsert for other tables
+            primary_key_identifier = sql.Identifier(primary_key)
+            update_cols = [col for col in df.columns if col != primary_key]
 
-            conn.commit()
-            print(f"{len(df)} records loaded into {table_name}.")
+            update_clause = sql.SQL(', ').join(
+                sql.SQL("{} = EXCLUDED.{}").format(sql.Identifier(col), sql.Identifier(col))
+                for col in update_cols
+            )
 
-    except (Exception, psycopg2.DatabaseError) as error:
-        print(f"Error loading data into {table_name}: {error}")
-    finally:
-        if conn is not None:
-            conn.close()
+            query = sql.SQL("INSERT INTO {} ({}) VALUES %s ON CONFLICT ({}) DO UPDATE SET {}").format(
+                table,
+                cols_sql,
+                primary_key_identifier,
+                update_clause,
+            )
+            for i in range(0, len(tuples), chunk_size):
+                execute_values(cur, query, tuples[i:i+chunk_size])
 
-def fetch_contributions_for_candidate(session, candidate_name):
+        conn.commit()
+        logger.info("%s records loaded into %s.", len(df), table_name)
+
+def fetch_contributions_for_candidate(session, api_key, candidate_name):
     """Fetches and transforms contributions for a single candidate."""
-    print(f"Fetching contributions for {candidate_name}...")
-    contributions_data = get_contributions(session, API_KEY, contributor_name=candidate_name)
+    logger.debug("Fetching contributions for %s", candidate_name)
+    contributions_data = get_contributions(session, api_key, contributor_name=candidate_name)
     return transform_contributions_to_df(contributions_data)
 
-def fetch_committee_details(session, committee_id):
+def fetch_committee_details(session, api_key, committee_id):
     """Fetches and transforms details for a single committee."""
-    print(f"Fetching committee {committee_id}...")
-    committee_data = get_committees(session, API_KEY, committee_id=committee_id)
+    logger.debug("Fetching committee %s", committee_id)
+    committee_data = get_committees(session, api_key, committee_id=committee_id)
     return transform_committees_to_df(committee_data)
 
 if __name__ == "__main__":
     fec_session = create_fec_session()
+    db_conn = None
     try:
+        db_conn = get_db_connection()
+        API_KEY = os.getenv("FEC_API_KEY")
+
         # 1. Fetch and load candidates
-        print("Fetching and loading candidates...")
+        logger.info("Fetching and loading candidates...")
         candidates_data = get_candidates(fec_session, API_KEY, cycle=2024, office="P")
         candidates_df = transform_candidates_to_df(candidates_data)
-        load_df_to_db(candidates_df, 'candidates', 'candidate_id')
+        if not candidates_df.empty:
+            load_df_to_db(db_conn, candidates_df, 'candidates', 'candidate_id')
 
         # 2. Fetch contributions in parallel and gather unique committee IDs
-        print("\nFetching contributions in parallel and gathering committee IDs...")
-        all_contributions_df = pd.DataFrame()
+        logger.info("Fetching contributions in parallel and gathering committee IDs...")
+        contrib_dfs = []
         all_committee_ids = set()
-        
-        with concurrent.futures.ThreadPoolExecutor() as executor:
-            future_to_candidate = {executor.submit(fetch_contributions_for_candidate, fec_session, name): name for name in candidates_df['name']}
-            for future in concurrent.futures.as_completed(future_to_candidate):
-                contributions_df = future.result()
-                if not contributions_df.empty:
-                    all_contributions_df = pd.concat([all_contributions_df, contributions_df], ignore_index=True)
-                    for committee_id in contributions_df['committee_id']:
-                        if committee_id:
-                            all_committee_ids.add(committee_id)
+        max_workers = min(8, max(2, (len(candidates_df) // 10) or 2))
 
-        print(f"Found {len(all_committee_ids)} unique committees.")
+        with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+            future_to_candidate = {executor.submit(fetch_contributions_for_candidate, fec_session, API_KEY, name): name for name in candidates_df['name']}
+            for future in concurrent.futures.as_completed(future_to_candidate):
+                name = future_to_candidate[future]
+                try:
+                    contributions_df = future.result()
+                except Exception as e:
+                    logger.exception("Failed to fetch contributions for %s: %s", name, e)
+                    continue
+                if not contributions_df.empty:
+                    contrib_dfs.append(contributions_df)
+                    for committee_id in contributions_df['committee_id'].dropna().unique():
+                        all_committee_ids.add(committee_id)
+
+        all_contributions_df = pd.concat(contrib_dfs, ignore_index=True) if contrib_dfs else pd.DataFrame()
+        logger.info("Found %d unique committees.", len(all_committee_ids))
+
+        # Normalize contributor fields and compute contributor_hash
+        if not all_contributions_df.empty:
+            all_contributions_df['contributor_name_norm'] = all_contributions_df['contributor_name'].apply(_normalize_str)
+            all_contributions_df['contributor_city_norm'] = all_contributions_df['contributor_city'].apply(_normalize_str)
+            all_contributions_df['contributor_state_norm'] = all_contributions_df['contributor_state'].apply(_normalize_str)
+            all_contributions_df['contributor_zip_code_norm'] = all_contributions_df['contributor_zip_code'].apply(_normalize_str)
+            all_contributions_df['contributor_occupation_norm'] = all_contributions_df['contributor_occupation'].apply(_normalize_str)
+            all_contributions_df['contributor_employer_norm'] = all_contributions_df['contributor_employer'].apply(_normalize_str)
+
+            def make_contributor_hash(row):
+                parts = [row['contributor_name_norm'], row['contributor_city_norm'], row['contributor_state_norm'], row['contributor_zip_code_norm'], row['contributor_occupation_norm'], row['contributor_employer_norm']]
+                return _sha256_hex('|'.join(parts))
+
+            all_contributions_df['contributor_hash'] = all_contributions_df.apply(make_contributor_hash, axis=1)
+
+            # Upsert contributors and obtain contributor_id mapping
+            contributors_df = all_contributions_df[['contributor_hash', 'contributor_name', 'contributor_city', 'contributor_state', 'contributor_zip_code', 'contributor_occupation', 'contributor_employer']].drop_duplicates('contributor_hash').rename(columns={
+                'contributor_name': 'name',
+                'contributor_city': 'city',
+                'contributor_state': 'state',
+                'contributor_zip_code': 'zip_code',
+                'contributor_occupation': 'occupation',
+                'contributor_employer': 'employer'
+            })
+
+            # Insert contributors using ON CONFLICT DO NOTHING, then select ids
+            with db_conn.cursor() as cur:
+                insert_cols = ['name', 'city', 'state', 'zip_code', 'occupation', 'employer', 'contributor_hash']
+                columns = [sql.Identifier(c) for c in insert_cols]
+                cols_sql = sql.SQL(', ').join(columns)
+                values_sql = sql.SQL(', ').join(sql.Placeholder() * len(insert_cols))
+                insert_query = sql.SQL('INSERT INTO contributors ({}) VALUES ({}) ON CONFLICT (contributor_hash) DO NOTHING').format(cols_sql, values_sql)
+                tuples = [tuple(row[col] if col in row else None for col in insert_cols) for _, row in contributors_df.iterrows()]
+                chunk_size = 500
+                for i in range(0, len(tuples), chunk_size):
+                    execute_values(cur, insert_query.as_string(db_conn), tuples[i:i+chunk_size], template=None, page_size=chunk_size)
+                db_conn.commit()
+
+                # Build mapping from contributor_hash to contributor_id
+                cur.execute("SELECT contributor_id, contributor_hash FROM contributors WHERE contributor_hash = ANY(%s)", (list(contributors_df['contributor_hash']),))
+                rows = cur.fetchall()
+                contributor_id_map = {r[1]: r[0] for r in rows}
+
+            # Attach contributor_id to contributions and compute contribution_hash
+            all_contributions_df['contributor_id'] = all_contributions_df['contributor_hash'].map(contributor_id_map)
+
+            def make_contribution_hash(row):
+                parts = [str(row.get('committee_id') or ''), str(row.get('contribution_date') or ''), str(row.get('contribution_amount') or ''), str(row.get('contributor_hash') or '')]
+                return _sha256_hex('|'.join(parts))
+
+            all_contributions_df['contribution_hash'] = all_contributions_df.apply(make_contribution_hash, axis=1)
+
+            # Deduplicate contributions by contribution_hash
+            all_contributions_df = all_contributions_df.drop_duplicates('contribution_hash')
 
         # 3. Fetch and load unique committees in parallel
-        print("\nFetching and loading unique committees in parallel...")
+        logger.info("Fetching and loading unique committees in parallel...")
         all_committees_df = pd.DataFrame()
         if all_committee_ids:
-            with concurrent.futures.ThreadPoolExecutor() as executor:
-                future_to_committee = {executor.submit(fetch_committee_details, fec_session, cid): cid for cid in all_committee_ids}
+            committee_dfs = []
+            max_workers = min(8, max(2, (len(all_committee_ids) // 10) or 2))
+            with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+                future_to_committee = {executor.submit(fetch_committee_details, fec_session, API_KEY, cid): cid for cid in all_committee_ids}
                 for future in concurrent.futures.as_completed(future_to_committee):
-                    committee_df = future.result()
-                    all_committees_df = pd.concat([all_committees_df, committee_df], ignore_index=True)
-            
-            load_df_to_db(all_committees_df, 'committees', 'committee_id')
+                    cid = future_to_committee[future]
+                    try:
+                        committee_df = future.result()
+                    except Exception as e:
+                        logger.exception("Failed to fetch committee %s: %s", cid, e)
+                        continue
+                    if not committee_df.empty:
+                        committee_dfs.append(committee_df)
+
+            all_committees_df = pd.concat(committee_dfs, ignore_index=True) if committee_dfs else pd.DataFrame()
+            if not all_committees_df.empty:
+                load_df_to_db(db_conn, all_committees_df, 'committees', 'committee_id')
 
         # 4. Load contributions
-        print("\nLoading contributions...")
-        load_df_to_db(all_contributions_df, 'contributions', 'contribution_id')
+        logger.info("Loading contributions...")
+        if not all_contributions_df.empty:
+            # Prepare final contributions DataFrame columns to match table
+            final_contribs = all_contributions_df[['committee_id', 'contributor_id', 'contribution_date', 'contribution_amount', 'contribution_hash']].copy()
+            load_df_to_db(db_conn, final_contribs, 'contributions', 'contribution_id')
 
+    except Exception as e:
+        logger.exception("An error occurred during the ETL process: %s", e)
     finally:
+        if db_conn:
+            db_conn.close()
+            logger.info("Database connection closed.")
         fec_session.close()
+
