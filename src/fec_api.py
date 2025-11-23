@@ -5,6 +5,7 @@ from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 from dotenv import load_dotenv
 import time
+import logging
 
 load_dotenv()
 
@@ -36,6 +37,7 @@ def _fetch_all_pages(session, url, params):
     params['page'] = 1
     params['per_page'] = 100
 
+    logging.info(f"Fetching from {url} with initial params: { {k: v for k, v in params.items() if k != 'api_key'} }")
     while True:
         try:
             response = session.get(url, params=params)
@@ -59,10 +61,10 @@ def _fetch_all_pages(session, url, params):
             time.sleep(1)
 
         except requests.exceptions.RequestException as e:
-            print(f"Error during API request: {e}")
+            logging.error(f"Error during API request: {e}")
             raise e
         except Exception as e:
-            print(f"An unexpected error occurred: {e}")
+            logging.error(f"An unexpected error occurred: {e}")
             raise e
 
     return {"results": all_results}
