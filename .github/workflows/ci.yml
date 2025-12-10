@@ -19,8 +19,12 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
       - name: Run migrations (dry-run)
+        env:
+          PYTHONPATH: src
         run: |
           python -c "import migrations.upgrade as m; print('migration module loaded')"
       - name: Run tests
+        env:
+          PYTHONPATH: src
         run: |
           python -m pytest -q
