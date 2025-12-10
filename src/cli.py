@@ -1,5 +1,5 @@
 import click
-from src import etl
+import etl
 
 
 @click.group()
