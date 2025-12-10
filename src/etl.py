@@ -101,7 +101,7 @@ def load_df_to_db(conn, df: pd.DataFrame, table_name: str, primary_key: str):
                 cols_sql,
             )
             for i in range(0, len(tuples), DEFAULT_CHUNK_SIZE_INSERT):
-                execute_values(cur, query, tuples[i:i+chunk_size])
+                execute_values(cur, query, tuples[i:i+DEFAULT_CHUNK_SIZE_INSERT])
         else:
             # Use primary key upsert for other tables
             primary_key_identifier = sql.Identifier(primary_key)
@@ -119,7 +119,7 @@ def load_df_to_db(conn, df: pd.DataFrame, table_name: str, primary_key: str):
                 update_clause,
             )
             for i in range(0, len(tuples), DEFAULT_CHUNK_SIZE_UPSERT):
-                execute_values(cur, query, tuples[i:i+chunk_size])
+                execute_values(cur, query, tuples[i:i+DEFAULT_CHUNK_SIZE_UPSERT])
 
         conn.commit()
         logger.info("%s records loaded into %s.", len(df), table_name)
